@@ -13,7 +13,8 @@ bot re-sends the stored Telegram file instantly instead of downloading it again.
    - **Hit:** the stored Telegram `file_id` is sent back immediately — no re-download,
      no re-upload. Request counters are bumped.
    - **Miss:** the bot downloads the track with [spotdl](https://github.com/spotDL/spotify-downloader),
-     uploads it to Telegram, and saves the metadata + `file_id` in MongoDB.
+     uploads it to Telegram with the track's cover art as the audio thumbnail,
+     and saves the metadata + `file_id` in MongoDB.
 3. If two users request the same not-yet-cached track at the same time, an
    in-flight lock makes sure it's only downloaded once (the second request
    waits and then gets the cached file).

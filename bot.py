@@ -28,6 +28,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 # Kurigram is a drop-in Pyrogram fork, so the import name stays `pyrogram`.
 from pyrogram import Client, filters, idle
+from pyrogram.handlers import MessageHandler
 from pyrogram.types import Message
 from motor.motor_asyncio import AsyncIOMotorClient
 
@@ -211,11 +212,13 @@ def fetch_and_download(url: str, tmpdir: Path):
 
 
 # ---------------------------------------------------------------- handlers
+# NOTE: handlers are plain functions, registered in main() via add_handler().
+# They must NOT use @app.on_message decorators at module level: pyrogram's
+# decorator path touches the event loop at import time, which pins the client
+# to a dead loop and crashes app.start() with "attached to a different loop"
+# when the program later runs under asyncio.run().
 
-app = Client("spotdl-bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-
-@app.on_message(filters.command("start") & filters.private)
 async def cmd_start(client: Client, message: Message):
     if message.from_user:
         await upsert_user(message.from_user)
@@ -227,7 +230,6 @@ async def cmd_start(client: Client, message: Message):
     )
 
 
-@app.on_message(filters.command("stats") & filters.private)
 async def cmd_stats(client: Client, message: Message):
     total_tracks = await tracks.count_documents({})
     agg = await tracks.aggregate(
@@ -349,7 +351,6 @@ async def handle_track(client: Client, message: Message, spotify_id: str) -> Non
         await download_and_send(client, message, spotify_id, url)
 
 
-@app.on_message(filters.text & ~filters.command(["start", "stats"]))
 async def handle_links(client: Client, message: Message):
     ids = TRACK_RE.findall(message.text or "")
     if not ids:
@@ -431,6 +432,23 @@ async def main() -> None:
 
     await init_db()
     await asyncio.to_thread(init_spotdl)
+
+    # Create the client and register handlers HERE, inside the running loop.
+    # (See the note above the handlers: doing it at module level pins the
+    # client to a dead import-time event loop.)
+    app = Client("spotdl-bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+    app.add_handler(
+        MessageHandler(cmd_start, filters.command("start") & filters.private)
+    )
+    app.add_handler(
+        MessageHandler(cmd_stats, filters.command("stats") & filters.private)
+    )
+    app.add_handler(
+        MessageHandler(
+            handle_links, filters.text & ~filters.command(["start", "stats"])
+        )
+    )
+
     await app.start()
     log.info("bot started — send it a Spotify track link")
     await idle()

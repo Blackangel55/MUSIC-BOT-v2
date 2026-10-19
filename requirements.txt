@@ -2,3 +2,4 @@ kurigram>=2.2
 motor>=3.3
 python-dotenv>=1.0
 spotdl>=4.2
+Pillow>=10.0
