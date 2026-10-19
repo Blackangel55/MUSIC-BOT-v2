@@ -14,17 +14,21 @@ Optional: MONGO_URI, MONGO_DB, MAX_CONCURRENT_DOWNLOADS, BITRATE,
 """
 
 import asyncio
+import io
 import logging
 import os
 import re
 import shutil
 import tempfile
+import threading
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
-from kurigram import Client, filters, idle
-from kurigram.types import Message
+# Kurigram is a drop-in Pyrogram fork, so the import name stays `pyrogram`.
+from pyrogram import Client, filters, idle
+from pyrogram.types import Message
 from motor.motor_asyncio import AsyncIOMotorClient
 
 load_dotenv()
@@ -153,10 +157,33 @@ def init_spotdl() -> None:
     )
 
 
+def fetch_cover(song, tmpdir: Path) -> Path | None:
+    """
+    Download the track's cover art and shrink it to Telegram's audio
+    thumbnail size (320x320 JPEG). Returns the path, or None on failure.
+    """
+    url = getattr(song, "cover_url", None)
+    if not url:
+        return None
+    try:
+        from PIL import Image
+
+        with urllib.request.urlopen(url, timeout=20) as resp:
+            data = resp.read()
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+        img.thumbnail((320, 320))
+        cover_path = tmpdir / "cover.jpg"
+        img.save(cover_path, "JPEG", quality=85)
+        return cover_path
+    except Exception:
+        log.warning("could not fetch cover art for %s", song.song_id, exc_info=True)
+        return None
+
+
 def fetch_and_download(url: str, tmpdir: Path):
     """
     Blocking: resolve the Spotify URL to a Song and download it into tmpdir.
-    Runs in a worker thread. Returns (song, path_to_audio).
+    Runs in a worker thread. Returns (song, path_to_audio, path_to_cover).
     """
     from spotdl.download.downloader import Downloader
 
@@ -179,7 +206,8 @@ def fetch_and_download(url: str, tmpdir: Path):
     _, path = downloader.download_song(song)
     if path is None or not Path(path).exists():
         raise RuntimeError("download produced no audio file")
-    return song, Path(path)
+    cover_path = fetch_cover(song, tmpdir)
+    return song, Path(path), cover_path
 
 
 # ---------------------------------------------------------------- handlers
@@ -244,7 +272,9 @@ async def download_and_send(
     tmpdir = Path(tempfile.mkdtemp(prefix="spotdl_"))
     try:
         async with download_sem:
-            song, path = await asyncio.to_thread(fetch_and_download, url, tmpdir)
+            song, path, cover_path = await asyncio.to_thread(
+                fetch_and_download, url, tmpdir
+            )
 
         if path.stat().st_size > MAX_TG_AUDIO_BYTES:
             await status.edit_text(
@@ -259,6 +289,7 @@ async def download_and_send(
             title=song.name,
             performer=", ".join(song.artists),
             duration=int(song.duration or 0),
+            thumb=str(cover_path) if cover_path else None,
         )
 
         await tracks.update_one(
@@ -339,9 +370,65 @@ async def handle_links(client: Client, message: Message):
         await handle_track(client, message, spotify_id)
 
 
+# ---------------------------------------------------------------- health check
+
+def start_health_server(port: int):
+    """
+    Minimal HTTP server so PaaS health checks (e.g. Koyeb web services)
+    see a healthy port. Runs in a daemon thread; the bot itself still
+    uses polling and needs no incoming connections.
+    """
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "HealthBot/1.0"
+
+        def _respond(self, include_body: bool):
+            body = b'{"status":"ok","service":"spotify-dl-bot"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if include_body:
+                self.wfile.write(body)
+
+        def _handle(self, include_body: bool):
+            if self.path in ("/", "/health", "/healthz"):
+                self._respond(include_body)
+            else:
+                self.send_error(404)
+
+        def do_GET(self):
+            self._handle(include_body=True)
+
+        def do_HEAD(self):
+            self._handle(include_body=False)
+
+        def log_message(self, *args):
+            log.debug("health: %s", args[0] % args[1:])
+
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    thread = threading.Thread(
+        target=server.serve_forever, daemon=True, name="health-server"
+    )
+    thread.start()
+    log.info("health check server listening on 0.0.0.0:%d", port)
+
+
 # ---------------------------------------------------------------- main
 
 async def main() -> None:
+    # Bind the health-check port first so the platform sees us as alive
+    # even while Telegram/MongoDB are still connecting. Koyeb sets PORT
+    # automatically for Web services; with a Worker service (or locally)
+    # PORT is unset and the server is skipped.
+    port = os.environ.get("PORT")
+    if port:
+        try:
+            start_health_server(int(port))
+        except ValueError:
+            log.warning("PORT=%r is not a number, skipping health server", port)
+
     await init_db()
     await asyncio.to_thread(init_spotdl)
     await app.start()
