@@ -150,7 +150,14 @@ def init_spotdl() -> None:
         # Without credentials spotdl falls back to its free (unofficial)
         # Spotify client; with credentials it uses the official API.
         use_official_api=bool(client_id and client_secret),
-        downloader_settings={"format": AUDIO_FORMAT, "bitrate": BITRATE},
+        downloader_settings={
+            "format": AUDIO_FORMAT,
+            "bitrate": BITRATE,
+            # No rich live progress bar: each Downloader would start its own
+            # and concurrent downloads crash with
+            # "Only one live display may be active at once".
+            "simple_tui": True,
+        },
     )
     log.info(
         "spotdl ready (%s Spotify client)",
@@ -202,6 +209,8 @@ def fetch_and_download(url: str, tmpdir: Path):
             "format": AUDIO_FORMAT,
             "bitrate": BITRATE,
             "overwrite": "force",
+            # See init_spotdl: skip the rich live progress bar.
+            "simple_tui": True,
         }
     )
     _, path = downloader.download_song(song)
